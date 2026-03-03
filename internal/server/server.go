@@ -253,6 +253,10 @@ func (w *completionLogger) Write(b []byte) (int, error) {
 	return n, err
 }
 
+func (w *completionLogger) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 func New(cfg *Config) *Server {
 	lb := NewLogBroadcaster()
 
@@ -673,14 +677,24 @@ func (s *Server) startHTTPServer() error {
 			return
 		}
 
-		rangeHeader := r.Header.Get("Range")
-		if rangeHeader == "" {
-			s.logAndBroadcast("ISO Download: Client MAC %s (IP: %s) started downloading %s (%d MB)", macAddress, r.RemoteAddr, decodedFilename, fileInfo.Size()/1024/1024)
-			s.activeSessions.Add(r.RemoteAddr, decodedFilename, fileInfo.Size(), "downloading")
-			defer s.activeSessions.Remove(r.RemoteAddr)
-		} else {
+		if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
 			log.Printf("ISO: Range request from MAC %s (IP: %s) for %s - Range: %s", macAddress, r.RemoteAddr, decodedFilename, rangeHeader)
+			w.Header().Set("Content-Type", "application/octet-stream")
+			http.ServeFile(w, r, fullPath)
+			return
 		}
+
+		s.logAndBroadcast("ISO Download: Client MAC %s (IP: %s) started downloading %s (%d MB)", macAddress, r.RemoteAddr, decodedFilename, fileInfo.Size()/1024/1024)
+		s.activeSessions.Add(r.RemoteAddr, decodedFilename, fileInfo.Size(), "downloading")
+		defer s.activeSessions.Remove(r.RemoteAddr)
+
+		f, err := os.Open(fullPath)
+		if err != nil {
+			s.logAndBroadcast("ISO: Failed to open file (MAC: %s, IP: %s): %v", macAddress, r.RemoteAddr, err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+		defer f.Close()
 
 		wrappedWriter := &completionLogger{
 			ResponseWriter: w,
@@ -691,8 +705,31 @@ func (s *Server) startHTTPServer() error {
 			activeSessions: s.activeSessions,
 		}
 
-		w.Header().Set("Content-Type", "application/octet-stream")
-		http.ServeFile(wrappedWriter, r, fullPath)
+		wrappedWriter.Header().Set("Content-Type", "application/octet-stream")
+		wrappedWriter.Header().Set("Content-Length", fmt.Sprintf("%d", fileInfo.Size()))
+		wrappedWriter.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", decodedFilename))
+		wrappedWriter.WriteHeader(http.StatusOK)
+
+		rc := http.NewResponseController(wrappedWriter)
+		buf := make([]byte, 256*1024) // 256KB chunks
+		for {
+			nr, readErr := f.Read(buf)
+			if nr > 0 {
+				_ = rc.SetWriteDeadline(time.Now().Add(60 * time.Second))
+				_, writeErr := wrappedWriter.Write(buf[:nr])
+				if writeErr != nil {
+					s.logAndBroadcast("ISO: Write failed to client %s (MAC: %s) during download of %s: %v", r.RemoteAddr, macAddress, decodedFilename, writeErr)
+					return
+				}
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				log.Printf("ISO: Read error for %s: %v", fullPath, readErr)
+				return
+			}
+		}
 	})
 
 	mux.HandleFunc("/boot/", func(w http.ResponseWriter, r *http.Request) {
