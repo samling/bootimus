@@ -677,6 +677,7 @@ func (s *Server) startHTTPServer() error {
 		if rangeHeader == "" {
 			s.logAndBroadcast("ISO Download: Client MAC %s (IP: %s) started downloading %s (%d MB)", macAddress, r.RemoteAddr, decodedFilename, fileInfo.Size()/1024/1024)
 			s.activeSessions.Add(r.RemoteAddr, decodedFilename, fileInfo.Size(), "downloading")
+			defer s.activeSessions.Remove(r.RemoteAddr)
 		} else {
 			log.Printf("ISO: Range request from MAC %s (IP: %s) for %s - Range: %s", macAddress, r.RemoteAddr, decodedFilename, rangeHeader)
 		}
